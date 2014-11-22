@@ -10,23 +10,16 @@ from astropy.modeling.parameters import Parameter
 from ..models.BSplineModel import BSplineModel
 import astropy.units as u
 
-from astropy.utils.misc import deprecated
 from astropy.utils import OrderedDict
 from astropy.io import fits
 import copy
 from astropy import constants
 import math
+import itertools
 
 ##### Delete at earliest convenience (currently deprecated)
 #### VVVVVVVVVV
 valid_spectral_units = [u.pix, u.km / u.s, u.m, u.Hz, u.erg]
-
-@deprecated('0.dev???', 'using no units is now allowed for WCS')
-def check_valid_unit(unit):
-    if not any([unit.is_equivalent(x) for x in valid_spectral_units]):
-        raise ValueError(
-            "Unit %r is not recognized as a valid spectral unit.  Valid units are: " % unit.to_string() +
-            ", ".join([x.to_string() for x in valid_spectral_units]))
 
 
 #^^^^^^^^^^^^^^^^^
@@ -51,6 +44,9 @@ class BaseSpectrum1DWCS(Model):
     n_outputs = 1
 
     _default_equivalencies = u.spectral()
+
+    def __init__(self, *args, **kwargs):
+        super(BaseSpectrum1DWCS, self).__init__(*args, **kwargs)
 
     @property
     def equivalencies(self):
@@ -80,7 +76,6 @@ class BaseSpectrum1DWCS(Model):
             self._unit = None
         else:
             self._unit = u.Unit(value)
-
 
     def reset_equivalencies(self):
         """
@@ -145,13 +140,20 @@ class Spectrum1DLookupWCS(BaseSpectrum1DWCS):
         self.pixel_index = np.arange(len(self.lookup_table_parameter.value))
 
     def __call__(self, pixel_indices):
-        if self.lookup_table_interpolation_kind == 'linear':
-            return np.interp(pixel_indices, self.pixel_index,
-                             self.lookup_table_parameter.value, left=np.nan,
-                             right=np.nan) * self.unit
+        return self.__class__.evaluate(pixel_indices,
+                                       self.lookup_table_parameter.value,
+                                       kind=self.lookup_table_interpolation_kind
+                                       , unit=self.unit)
+
+    @classmethod
+    def evaluate(cls, pixel_indices, lookup_table, kind='linear', unit=None):
+        pixel_index = np.arange(len(lookup_table))
+        if kind == 'linear':
+            return np.interp(pixel_indices, pixel_index, lookup_table,
+                             left=np.nan, right=np.nan) * unit
         else:
             raise NotImplementedError(
-                'Interpolation type %s is not implemented' % self.lookup_table_interpolation_kind)
+                'Interpolation type %s is not implemented' % kind)
 
 
     def invert(self, dispersion_values):
@@ -163,58 +165,6 @@ class Spectrum1DLookupWCS(BaseSpectrum1DWCS):
         else:
             raise NotImplementedError(
                 'Interpolation type %s is not implemented' % self.lookup_table_interpolation_kind)
-
-
-class Spectrum1DLinearWCS(BaseSpectrum1DWCS):
-    """
-    A simple linear wcs
-    """
-
-    dispersion0 = Parameter('dispersion0')
-    dispersion_delta = Parameter('dispersion_delta')
-
-    @deprecated('0.dev??', message='please use Spectrum1DPolynomialWCS')
-    def __init__(self, dispersion0, dispersion_delta, pixel_index, unit):
-        super(Spectrum1DLinearWCS, self).__init__()
-
-        #### Not clear what to do about units of dispersion0 and dispersion_delta.
-        # dispersion0 should have units like angstrom, whereas dispersion_delta should have units like angstrom/pix
-        # for now I assume pixels don't have units and both dispersion0 and dispersion_delta should have the same unit
-        dispersion0 = u.Quantity(dispersion0, unit)
-        dispersion_delta = u.Quantity(dispersion_delta, unit)
-
-        check_valid_unit(dispersion0.unit)
-        check_valid_unit(dispersion_delta.unit)
-
-
-        ##### Quick fix - needs to be fixed in modelling ###
-        if unit is None:
-            unit = dispersion0.unit
-
-        self.unit = unit
-
-        self.dispersion0 = dispersion0.value
-        self.dispersion_delta = dispersion_delta.value
-        self.pixel_index = pixel_index
-
-
-    def __call__(self, pixel_indices):
-        if misc.isiterable(pixel_indices) and not isinstance(pixel_indices,
-                                                             six.string_types):
-            pixel_indices = np.array(pixel_indices)
-        return (self.dispersion0 + self.dispersion_delta * (
-            pixel_indices - self.pixel_index)) * self.unit
-
-    def invert(self, dispersion_values):
-        if not hasattr(dispersion_values, 'unit'):
-            raise u.UnitsException(
-                'Must give a dispersion value with a valid unit (i.e. quantity 5 * u.Angstrom)')
-
-        if misc.isiterable(dispersion_values) and not isinstance(
-                dispersion_values, six.string_types):
-            dispersion_values = np.array(dispersion_values)
-        return float((
-                         dispersion_values - self.dispersion0) / self.dispersion_delta) + self.pixel_index
 
 
 class Spectrum1DPolynomialWCS(BaseSpectrum1DWCS, polynomial.Polynomial1D):
@@ -229,12 +179,22 @@ class Spectrum1DPolynomialWCS(BaseSpectrum1DWCS, polynomial.Polynomial1D):
         self.unit = unit
 
         self.fits_header_writers = {'linear': self._write_fits_header_linear,
-                                    'matrix': self._write_fits_header_matrix,
-                                    'multispec': self._write_fits_header_multispec}
+                                    'matrix': self._write_fits_header_matrix}
 
-    def __call__(self, pixel_indices):
-        return super(Spectrum1DPolynomialWCS, self).__call__(
-            pixel_indices) * self.unit
+    def __call__(self, *inputs, **kwargs):
+        inputs, format_info = self.prepare_inputs(*inputs, **kwargs)
+        outputs = self.evaluate(*itertools.chain(inputs, [self.unit],
+                                                 self.param_sets))
+
+        if self.n_outputs == 1:
+            outputs = (outputs,)
+
+        return self.prepare_outputs(format_info, *outputs, **kwargs)
+
+    @classmethod
+    def evaluate(cls, pixel_indices, unit=None, *coeffs):
+        return super(Spectrum1DPolynomialWCS, cls).evaluate(pixel_indices,
+                                                            *coeffs) * unit
 
     def write_fits_header(self, header, spectral_axis=1, method='linear'):
         self.fits_header_writers[method](header, spectral_axis)
@@ -267,10 +227,6 @@ class Spectrum1DPolynomialWCS(BaseSpectrum1DWCS, polynomial.Polynomial1D):
 
             header['cunit{0}'.format(spectral_axis)] = unit_string
 
-    # can only be implemented, when the reader is in place
-    def _write_fits_header_multispec(self, header, spectral_axis=1):
-        pass
-
 
 class Spectrum1DIRAFLegendreWCS(BaseSpectrum1DWCS, polynomial.Legendre1D):
     """
@@ -289,6 +245,9 @@ class Spectrum1DIRAFLegendreWCS(BaseSpectrum1DWCS, polynomial.Legendre1D):
         return super(Spectrum1DIRAFLegendreWCS, self).__call__(transformed)
 
     def get_fits_spec(self):
+        # if abs(self.indexer.step) != 1:
+        #     raise Spectrum1DWCSFITSError("WCS with indexer step greater than 1"
+        #                                  "cannot be written")
         func_type = 2
         order = self.degree + 1
         coefficients = [self.__getattr__('c{0}'.format(i)).value
@@ -318,6 +277,9 @@ class Spectrum1DIRAFChebyshevWCS(BaseSpectrum1DWCS, polynomial.Chebyshev1D):
         return super(Spectrum1DIRAFChebyshevWCS, self).__call__(transformed)
 
     def get_fits_spec(self):
+        # if abs(self.indexer.step) != 1:
+        #     raise Spectrum1DWCSFITSError("WCS with indexer step greater than 1"
+        #                                  "cannot be written")
         func_type = 1
         order = self.degree + 1
         coefficients = [self.__getattr__('c{0}'.format(i)).value
@@ -333,8 +295,6 @@ class Spectrum1DIRAFBSplineWCS(BaseSpectrum1DWCS, BSplineModel):
 
     def __init__(self, degree, npieces, y, pmin, pmax):
         from scipy.interpolate import splrep
-        self.pmin = pmin
-        self.pmax = pmax
         self.npieces = npieces
         self.y = y
 
@@ -342,6 +302,8 @@ class Spectrum1DIRAFBSplineWCS(BaseSpectrum1DWCS, BSplineModel):
         knots, coefficients, _ = splrep(x, y, k=degree)
         super(Spectrum1DIRAFBSplineWCS, self).__init__(degree, knots,
                                                        coefficients)
+        self.pmin = pmin
+        self.pmax = pmax
 
     def __call__(self, pixel_indices):
         s = (pixel_indices * 1.0 * self.npieces) / (self.pmax - self.pmin)
@@ -356,50 +318,6 @@ class Spectrum1DIRAFBSplineWCS(BaseSpectrum1DWCS, BSplineModel):
             raise Spectrum1DWCSFITSError("Fits spec undefined for degree = "
                                          "{0}".format(self.degree))
         return [func_type, self.npieces, self.pmin, self.pmax] + self.y
-
-
-class Spectrum1DIRAFCombinationWCS(BaseSpectrum1DWCS):
-    """
-    WCS that combines multiple WCS using their weights, zero index and doppler
-    factor. The formula used is:
-    Dispersion = Sum over all WCS
-        [Weight * (Zero point offset + WCS(pixels)) / (1 + doppler factor)]
-    """
-    def __init__(self, num_pixels, aperture=1, beam=88, aperture_low=0.0,
-                 aperture_high=0.0, doppler_factor=0.0, unit=None):
-        self.wcs_list = []
-        self.aperture = aperture
-        self.beam = beam
-        self.num_pixels = num_pixels
-        self.aperture_low = aperture_low
-        self.aperture_high = aperture_high
-        self.doppler_factor = doppler_factor
-        self.unit = unit
-
-
-    def add_WCS(self, wcs, weight=1.0, zero_point_offset=0.0):
-        self.wcs_list.append((wcs, weight, zero_point_offset))
-
-    def __call__(self, pixel_indices):
-        final_dispersion = np.zeros(len(pixel_indices))
-        for wcs, weight, zero_point_offset in self.wcs_list:
-            dispersion = weight * (zero_point_offset + wcs(pixel_indices))
-            final_dispersion += dispersion / (1 + self.doppler_factor)
-        return final_dispersion * self.unit
-
-    def get_fits_spec(self):
-        disp_type = 2
-        dispersion0 = self.__call__(np.zeros(1))[0].value
-        dispersion = self.__call__(np.arange(self.num_pixels)).value
-        avg_disp_delta = (dispersion[1:] - dispersion[:-1]).mean()
-        spec = [self.aperture, self.beam, disp_type, dispersion0,
-                avg_disp_delta, self.num_pixels, self.doppler_factor,
-                self.aperture_low, self.aperture_high]
-        for wcs, weight, zero_point_offset in self.wcs_list:
-            spec.extend([weight, zero_point_offset])
-            spec.extend(wcs.get_fits_spec())
-
-        return " ".join(map(str, spec))
 
 
 class WeightedCombinationWCS(Model):
@@ -418,16 +336,17 @@ class WeightedCombinationWCS(Model):
         The object's wcs_list will be instantiated using wcs from this list,
         with weight as 1.0, and zero point offset as 0.0
     """
-    def __init__(self, wcs_list=[]):
+    def __init__(self, wcs_list=None):
         self.wcs_list = []
-        for wcs in wcs_list:
-            self.add_WCS(wcs)
+        if wcs_list is not None:
+            for wcs in wcs_list:
+                self.add_WCS(wcs)
 
     def add_WCS(self, wcs, weight=1.0, zero_point_offset=0.0):
         """
         Add a WCS/function pointer to be evaluated when this WCS is called. The
         results of calling this WCS on the input will be added to the overall
-        result, after applying the weight and the ero point offset.
+        result, after applying the weight and the zero point offset.
 
         Parameters
         -----------
@@ -451,10 +370,15 @@ class WeightedCombinationWCS(Model):
         input : numpy array
             The input to the composite WCS
         """
-        output = np.zeros(len(input))
-        for wcs, weight, zero_point_offset in self.wcs_list:
+        return self.__class__.evaluate(input, self.wcs_list)
+
+    @classmethod
+    def evaluate(cls, input, wcs_list):
+        output = np.zeros(len(input) if hasattr(input, "__len__") else 1)
+        for wcs, weight, zero_point_offset in wcs_list:
             output += weight * (zero_point_offset + wcs(input))
         return output
+
 
 
 class CompositeWCS(Model):
@@ -471,10 +395,11 @@ class CompositeWCS(Model):
     wcs_list : list of callable objects, optional
         The object's wcs_list will be instantiated using wcs from this list
     """
-    def __init__(self, wcs_list=[]):
+    def __init__(self, wcs_list=None):
         self.wcs_list = []
-        for wcs in wcs_list:
-            self.add_WCS(wcs)
+        if wcs_list is not None:
+            for wcs in wcs_list:
+                self.add_WCS(wcs)
 
     def add_WCS(self, wcs):
         """
@@ -498,10 +423,15 @@ class CompositeWCS(Model):
         input : numpy array
             The input to the composite WCS
         """
+        return self.__class__.evaluate(input, self.wcs_list)
+
+    @classmethod
+    def evaluate(cls, input, wcs_list):
         output = input
-        for wcs in self.wcs_list:
+        for wcs in wcs_list:
             output = wcs(output)
         return output
+
 
 class DopplerShift(Model):
     """
@@ -559,7 +489,11 @@ class DopplerShift(Model):
         input : numpy array
             The input to be shifted
         """
-        return input * self.doppler_factor
+        return self.__class__.evaluate(input, self.doppler_factor)
+
+    @classmethod
+    def evaluate(cls, input, doppler_factor):
+        return input * doppler_factor
 
     def inverse(self):
         """
@@ -576,16 +510,101 @@ class DopplerShift(Model):
     def doppler_factor(self):
         return math.sqrt((1 + self.beta)/(1 - self.beta))
 
+    @property
+    def redshift(self):
+        return self.doppler_factor - 1
 
-@deprecated('0.dev???')
-def _parse_doppler_convention(dc):
-    dcd = {'relativistic': u.doppler_relativistic,
-           'radio': u.doppler_radio,
-           'optical': u.doppler_optical}
-    if dc in dcd:
-        return dcd[dc]
-    elif dc in dcd.values():  # allow users to specify the convention directly
-        return dc
-    else:
-        raise ValueError(
-            "Doppler convention must be one of " + ",".join(dcd.keys()))
+
+class MultispecIRAFCompositeWCS(BaseSpectrum1DWCS, CompositeWCS):
+    """
+    A specialized composite WCS model for IRAF FITS multispec specification.
+    This model adds applies doppler adjustment and log (if applicable) to the
+    dispersion WCS. The dispersion WCS may be a linear WCS or a weighted
+    combination WCS. This model stores FITS metadata and also provides a method
+    to generate the  multispec string for the FITS header.
+
+    Parameters
+    -----------
+    dispersion_wcs : Model
+        the wcs that returns the raw dispersion when passed the pixel
+        coordinates. There is no doppler shift applied to this dispersion
+    num_pixels : int
+        the number of valid pixels
+    z : float, optional
+        the redshift, used to determine the doppler shift needed to correct the
+        dispersion. Th default value indictes there is no shift
+    log : bool, optional
+        whether log correction needs to be applied to the dispersion
+    aperture : int, optional
+        the aperture number
+    beam : int, optional
+        the beam number
+    aperture_low : float, optional
+        the lower aperture limit
+    aperture_high : float, optional
+        the higher aperture limit
+    unit: astropy.unit, optional
+        the unit of the dispersion
+    """
+
+    def __init__(self, dispersion_wcs, num_pixels, z=1.0, log=False,
+                 aperture=1, beam=88, aperture_low=0.0, aperture_high=0.0,
+                 unit=None):
+        doppler_wcs = DopplerShift.from_redshift(z).inverse
+        super(MultispecIRAFCompositeWCS, self).__init__([dispersion_wcs,
+                                                         doppler_wcs])
+        self.aperture = aperture
+        self.beam = beam
+        self.num_pixels = num_pixels
+        self.aperture_low = aperture_low
+        self.aperture_high = aperture_high
+        self.unit = unit
+        if log:
+            self.add_WCS(lambda x: 10 ** x)
+
+    def __call__(self, pixel_indices):
+        """
+        Applies the model to the pixel coordinates, to produce the dispersion
+        at those pixels
+
+        Parameters
+        -----------
+        pixel_indices : numpy array
+            the pixel coordinates on which dispersion needs to be computed
+        """
+        dispersion = super(MultispecIRAFCompositeWCS,
+                           self).__call__(pixel_indices)
+        return dispersion * self.unit
+
+    def get_fits_spec(self):
+        """
+        Returns the list of spec parameters that represent this model in the
+        order they are supposed to be stored in FITS files
+        """
+        if len(self.wcs_list) == 3:
+            # we don't need to compute the log of dispersion while writing
+            log_wcs = self.wcs_list.pop()
+            dispersion_type = 1
+        else:
+            log_wcs = None
+            dispersion_type = 0
+        dispersion_wcs, doppler_wcs = self.wcs_list
+        if isinstance(dispersion_wcs, WeightedCombinationWCS):
+            dispersion_type = 2
+        # else dispersion_wcs instance of Spectrum1DPolynomialWCS
+        dispersion = self.__call__(np.arange(self.num_pixels)).value
+        avg_disp_delta = (dispersion[1:] - dispersion[:-1]).mean()
+        z = doppler_wcs.redshift
+        spec = [self.aperture, self.beam, dispersion_type, dispersion[0],
+                avg_disp_delta, self.num_pixels, z,
+                self.aperture_low, self.aperture_high]
+        if dispersion_type == 2:
+            # add the parameters of the functions to the spec string
+            for wcs, weight, zero_point_offset in dispersion_wcs.wcs_list:
+                spec.extend([weight, zero_point_offset])
+                spec.extend(wcs.get_fits_spec())
+        if dispersion_type == 1:
+            # add the log_wcs back
+            self.add_WCS(log_wcs)
+
+        return spec
